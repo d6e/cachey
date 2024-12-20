@@ -44,14 +44,6 @@ async fn put_cache(
 ) -> Result<HttpResponse> {
     let file_path = get_file_path(&data.cache_dir, &key);
 
-    // Check if file already exists
-    if file_path.exists() {
-        warn!("PUT conflict - key already exists: {}", key);
-        return Ok(HttpResponse::Conflict()
-            .content_type("text/plain")
-            .body("Key already exists"));
-    }
-
     // Create cache directory if it doesn't exist
     if !data.cache_dir.exists() {
         if let Err(e) = fs::create_dir_all(&data.cache_dir) {
@@ -63,9 +55,20 @@ async fn put_cache(
         }
     }
 
-    // Open file with async writer
-    let file = match tokio::fs::File::create(&file_path).await {
-        Ok(f) => f,
+    // Try to create the file with OpenOptions to handle race conditions
+    let file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true) // This ensures atomic create-if-not-exists
+        .open(&file_path)
+        .await
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            warn!("PUT conflict - key already exists: {}", key);
+            return Ok(HttpResponse::Conflict()
+                .content_type("text/plain")
+                .body("Key already exists"));
+        }
         Err(e) => {
             error!("Failed to create file for key {}: {}", key, e);
             return Err(actix_web::error::ErrorInternalServerError(format!(
@@ -74,42 +77,56 @@ async fn put_cache(
             )));
         }
     };
+
     let mut writer = tokio::io::BufWriter::with_capacity(BUFFER_SIZE, file);
 
     // Stream the file contents
     let mut total_bytes = 0;
     while let Some(chunk) = payload.next().await {
-        let chunk = match chunk {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Failed to read chunk for key {}: {}", key, e);
-                return Err(actix_web::error::ErrorInternalServerError(format!(
-                    "Failed to read chunk: {}",
-                    e
-                )));
-            }
-        };
+        let chunk = chunk.map_err(|e| {
+            error!("Failed to read chunk for key {}: {}", key, e);
+            actix_web::error::ErrorInternalServerError(format!("Failed to read chunk: {}", e))
+        })?;
+
         total_bytes += chunk.len();
-        if let Err(e) = writer.write_all(&chunk).await {
+        writer.write_all(&chunk).await.map_err(|e| {
             error!("Failed to write chunk for key {}: {}", key, e);
-            return Err(actix_web::error::ErrorInternalServerError(format!(
-                "Failed to write chunk: {}",
-                e
-            )));
-        }
+            actix_web::error::ErrorInternalServerError(format!("Failed to write chunk: {}", e))
+        })?;
     }
 
     // Ensure all data is written to disk
-    if let Err(e) = writer.flush().await {
+    writer.flush().await.map_err(|e| {
         error!("Failed to flush file for key {}: {}", key, e);
-        return Err(actix_web::error::ErrorInternalServerError(format!(
-            "Failed to flush file: {}",
-            e
-        )));
-    }
+        actix_web::error::ErrorInternalServerError(format!("Failed to flush file: {}", e))
+    })?;
 
     info!("Successfully stored key {} ({} bytes)", key, total_bytes);
     Ok(HttpResponse::Created().finish())
+}
+
+async fn head_cache(
+    key: web::Path<String>,
+    data: web::Data<AppState>,
+) -> Result<HttpResponse, Error> {
+    let file_path = get_file_path(&data.cache_dir, &key);
+
+    if !file_path.exists() {
+        return Ok(HttpResponse::NotFound().finish());
+    }
+
+    match tokio::fs::metadata(&file_path).await {
+        Ok(metadata) => Ok(HttpResponse::Ok()
+            .append_header(("content-length", metadata.len().to_string()))
+            .finish()),
+        Err(e) => {
+            error!("Failed to read metadata for key {}: {}", key, e);
+            Err(actix_web::error::ErrorInternalServerError(format!(
+                "Failed to read file metadata: {}",
+                e
+            )))
+        }
+    }
 }
 
 async fn get_cache(
@@ -179,7 +196,8 @@ pub async fn run(base_url: String) -> std::io::Result<()> {
             .service(
                 web::resource("/cache/{key}")
                     .route(web::put().to(put_cache))
-                    .route(web::get().to(get_cache)),
+                    .route(web::get().to(get_cache))
+                    .route(web::head().to(head_cache)),
             )
     })
     .bind(url_no_scheme)?

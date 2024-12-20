@@ -100,6 +100,17 @@ impl CacheClient {
         }
     }
 
+    /// Check if a key exists in the cache using a HEAD request
+    async fn check_key_exists(&self, key: &str) -> Result<bool, CacheError> {
+        let response = self
+            .client
+            .head(&format!("{}/cache/{}", self.base_url, key))
+            .send()
+            .await?;
+
+        Ok(response.status() == StatusCode::OK)
+    }
+
     /// Download multiple files from the cache, saving them to the current directory
     pub async fn batch_download(&self, filenames: &[String]) -> Vec<BatchResultDownload> {
         let mut results = Vec::with_capacity(filenames.len());
@@ -110,7 +121,7 @@ impl CacheClient {
             let filename = filename.clone();
             async move {
                 let result = match tokio::time::timeout(
-                    Duration::from_secs(30), // Add timeout
+                    self.config.operation_timeout,
                     self.get_file(&filename, Path::new(&filename)),
                 )
                 .await
@@ -156,7 +167,7 @@ impl CacheClient {
             let filename = filename.clone();
             async move {
                 let result = match tokio::time::timeout(
-                    Duration::from_secs(30), // Add timeout
+                    self.config.operation_timeout,
                     self.put_file(Path::new(&filename)),
                 )
                 .await
@@ -198,6 +209,12 @@ impl CacheClient {
 
     async fn put_file(&self, file_path: &Path) -> Result<(), CacheError> {
         let key = file_path.file_name().unwrap().to_str().unwrap().to_string();
+
+        // First check if the key exists using HEAD request
+        if self.check_key_exists(&key).await? {
+            return Err(CacheError::KeyExists(key));
+        }
+
         let file = File::open(file_path).await.map_err(|e| CacheError::Io {
             path: file_path.to_path_buf(),
             source: e,
@@ -233,7 +250,7 @@ impl CacheClient {
         match response.status() {
             StatusCode::CREATED => Ok(()),
             StatusCode::CONFLICT => {
-                // Treat conflict as a skip.
+                // This should rarely happen now since we check first
                 Err(CacheError::KeyExists(key.to_string()))
             }
             status => Err(CacheError::Server(format!("Unexpected status: {}", status))),
