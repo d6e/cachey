@@ -7,8 +7,28 @@ use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
-const BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer for streaming
-const MAX_CONCURRENT_OPERATIONS: usize = 10;
+#[derive(Debug, Clone)]
+pub struct CacheClientConfig {
+    pub buffer_size: usize,
+    pub max_concurrent_operations: usize,
+    pub operation_timeout: Duration,
+    pub keep_alive_timeout: Duration,
+    pub pool_idle_timeout: Duration,
+    pub max_idle_per_host: usize,
+}
+
+impl Default for CacheClientConfig {
+    fn default() -> Self {
+        Self {
+            buffer_size: 64 * 1024, // 64KB buffer for streaming
+            max_concurrent_operations: 10,
+            operation_timeout: Duration::from_secs(30),
+            keep_alive_timeout: Duration::from_secs(60),
+            pool_idle_timeout: Duration::from_secs(30),
+            max_idle_per_host: 10,
+        }
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum CacheError {
@@ -55,42 +75,69 @@ pub struct BatchResultUpload {
 pub struct CacheClient {
     client: Client,
     base_url: String,
+    config: CacheClientConfig,
 }
 
 impl CacheClient {
     /// Create a new cache client with optimized settings
     pub fn new(base_url: String) -> Self {
+        Self::with_config(base_url, CacheClientConfig::default())
+    }
+
+    pub fn with_config(base_url: String, config: CacheClientConfig) -> Self {
         let client = Client::builder()
-            .pool_max_idle_per_host(10)
-            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(config.max_idle_per_host)
+            .pool_idle_timeout(config.pool_idle_timeout)
             .tcp_nodelay(true)
-            .tcp_keepalive(Duration::from_secs(60))
+            .tcp_keepalive(config.keep_alive_timeout)
             .build()
             .expect("Failed to create HTTP client");
 
-        Self { client, base_url }
+        Self {
+            client,
+            base_url,
+            config,
+        }
     }
 
     /// Download multiple files from the cache, saving them to the current directory
     pub async fn batch_download(&self, filenames: &[String]) -> Vec<BatchResultDownload> {
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(filenames.len());
+        let total_files = filenames.len();
+        let mut processed = 0;
 
         let mut downloads = futures::stream::iter(filenames.iter().map(|filename| {
             let filename = filename.clone();
             async move {
-                match self.get_file(&filename, Path::new(&filename)).await {
-                    Ok(_) => BatchResultDownload {
+                let result = match tokio::time::timeout(
+                    Duration::from_secs(30), // Add timeout
+                    self.get_file(&filename, Path::new(&filename)),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => BatchResultDownload {
                         filename: filename.clone(),
                         status: DownloadStatus::Success,
                     },
-                    Err(e) => BatchResultDownload {
+                    Ok(Err(e)) => BatchResultDownload {
                         filename: filename.clone(),
                         status: DownloadStatus::Error(e),
                     },
+                    Err(_) => BatchResultDownload {
+                        filename: filename.clone(),
+                        status: DownloadStatus::Error(CacheError::Server(
+                            "Operation timed out".to_string(),
+                        )),
+                    },
+                };
+                processed += 1;
+                if processed % 10 == 0 || processed == total_files {
+                    println!("Progress: {}/{} files processed", processed, total_files);
                 }
+                result
             }
         }))
-        .buffer_unordered(MAX_CONCURRENT_OPERATIONS);
+        .buffer_unordered(self.config.max_concurrent_operations);
 
         while let Some(result) = downloads.next().await {
             results.push(result);
@@ -101,28 +148,46 @@ impl CacheClient {
 
     /// Upload multiple files to the cache from the current directory
     pub async fn batch_upload(&self, filenames: &[String]) -> Vec<BatchResultUpload> {
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(filenames.len());
+        let total_files = filenames.len();
+        let mut processed = 0;
 
         let mut uploads = futures_util::stream::iter(filenames.iter().map(|filename| {
             let filename = filename.clone();
             async move {
-                match self.put_file(&filename, Path::new(&filename)).await {
-                    Ok(_) => BatchResultUpload {
+                let result = match tokio::time::timeout(
+                    Duration::from_secs(30), // Add timeout
+                    self.put_file(Path::new(&filename)),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => BatchResultUpload {
                         filename: filename.clone(),
                         status: UploadStatus::Success,
                     },
-                    Err(CacheError::KeyExists(_)) => BatchResultUpload {
+                    Ok(Err(CacheError::KeyExists(_))) => BatchResultUpload {
                         filename: filename.clone(),
                         status: UploadStatus::Skip,
                     },
-                    Err(e) => BatchResultUpload {
+                    Ok(Err(e)) => BatchResultUpload {
                         filename: filename.clone(),
                         status: UploadStatus::Error(e),
                     },
+                    Err(_) => BatchResultUpload {
+                        filename: filename.clone(),
+                        status: UploadStatus::Error(CacheError::Server(
+                            "Operation timed out".to_string(),
+                        )),
+                    },
+                };
+                processed += 1;
+                if processed % 10 == 0 || processed == total_files {
+                    println!("Progress: {}/{} files processed", processed, total_files);
                 }
+                result
             }
         }))
-        .buffer_unordered(MAX_CONCURRENT_OPERATIONS);
+        .buffer_unordered(self.config.max_concurrent_operations);
 
         while let Some(result) = uploads.next().await {
             results.push(result);
@@ -131,7 +196,8 @@ impl CacheClient {
         results
     }
 
-    async fn put_file(&self, key: &str, file_path: &Path) -> Result<(), CacheError> {
+    async fn put_file(&self, file_path: &Path) -> Result<(), CacheError> {
+        let key = file_path.file_name().unwrap().to_str().unwrap().to_string();
         let file = File::open(file_path).await.map_err(|e| CacheError::Io {
             path: file_path.to_path_buf(),
             source: e,
@@ -146,8 +212,8 @@ impl CacheClient {
             })?
             .len();
 
-        let mut buf_reader = BufReader::with_capacity(BUFFER_SIZE, file);
-        let mut buffer = Vec::with_capacity(BUFFER_SIZE);
+        let mut buf_reader = BufReader::with_capacity(self.config.buffer_size, file);
+        let mut buffer = Vec::with_capacity(self.config.buffer_size);
         buf_reader
             .read_to_end(&mut buffer)
             .await
