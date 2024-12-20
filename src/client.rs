@@ -28,10 +28,28 @@ pub enum CacheError {
 }
 
 #[derive(Debug)]
-pub struct BatchResult {
+pub enum DownloadStatus {
+    Success,
+    Error(CacheError),
+}
+
+#[derive(Debug)]
+pub struct BatchResultDownload {
     pub filename: String,
-    pub success: bool,
-    pub error: Option<CacheError>,
+    pub status: DownloadStatus,
+}
+
+#[derive(Debug)]
+pub enum UploadStatus {
+    Success,
+    Error(CacheError),
+    Skip,
+}
+
+#[derive(Debug)]
+pub struct BatchResultUpload {
+    pub filename: String,
+    pub status: UploadStatus,
 }
 
 pub struct CacheClient {
@@ -54,17 +72,21 @@ impl CacheClient {
     }
 
     /// Download multiple files from the cache, saving them to the current directory
-    pub async fn batch_download(&self, filenames: &[String]) -> Vec<BatchResult> {
+    pub async fn batch_download(&self, filenames: &[String]) -> Vec<BatchResultDownload> {
         let mut results = Vec::new();
 
         let mut downloads = futures::stream::iter(filenames.iter().map(|filename| {
             let filename = filename.clone();
             async move {
-                let result = self.get_file(&filename, Path::new(&filename)).await;
-                BatchResult {
-                    filename: filename.clone(),
-                    success: result.is_ok(),
-                    error: result.err(),
+                match self.get_file(&filename, Path::new(&filename)).await {
+                    Ok(_) => BatchResultDownload {
+                        filename: filename.clone(),
+                        status: DownloadStatus::Success,
+                    },
+                    Err(e) => BatchResultDownload {
+                        filename: filename.clone(),
+                        status: DownloadStatus::Error(e),
+                    },
                 }
             }
         }))
@@ -76,18 +98,27 @@ impl CacheClient {
 
         results
     }
+
     /// Upload multiple files to the cache from the current directory
-    pub async fn batch_upload(&self, filenames: &[String]) -> Vec<BatchResult> {
+    pub async fn batch_upload(&self, filenames: &[String]) -> Vec<BatchResultUpload> {
         let mut results = Vec::new();
 
         let mut uploads = futures_util::stream::iter(filenames.iter().map(|filename| {
             let filename = filename.clone();
             async move {
-                let result = self.put_file(&filename, Path::new(&filename)).await;
-                BatchResult {
-                    filename: filename.clone(),
-                    success: result.is_ok(),
-                    error: result.err(),
+                match self.put_file(&filename, Path::new(&filename)).await {
+                    Ok(_) => BatchResultUpload {
+                        filename: filename.clone(),
+                        status: UploadStatus::Success,
+                    },
+                    Err(CacheError::KeyExists(_)) => BatchResultUpload {
+                        filename: filename.clone(),
+                        status: UploadStatus::Skip,
+                    },
+                    Err(e) => BatchResultUpload {
+                        filename: filename.clone(),
+                        status: UploadStatus::Error(e),
+                    },
                 }
             }
         }))
@@ -135,7 +166,10 @@ impl CacheClient {
 
         match response.status() {
             StatusCode::CREATED => Ok(()),
-            StatusCode::CONFLICT => Err(CacheError::KeyExists(key.to_string())),
+            StatusCode::CONFLICT => {
+                // Treat conflict as a skip.
+                Err(CacheError::KeyExists(key.to_string()))
+            }
             status => Err(CacheError::Server(format!("Unexpected status: {}", status))),
         }
     }
@@ -163,7 +197,6 @@ impl CacheClient {
                         path: output_path.to_path_buf(),
                         source: e,
                     })?;
-
                 Ok(())
             }
             StatusCode::NOT_FOUND => Err(CacheError::KeyNotFound(key.to_string())),
@@ -178,10 +211,16 @@ pub async fn upload(base_url: String, files: Vec<String>) -> std::io::Result<()>
     let results = client.batch_upload(&files).await;
 
     for result in results {
-        if result.success {
-            println!("✓ Successfully uploaded: {}", result.filename);
-        } else {
-            eprintln!("✗ Failed to upload {}: {:?}", result.filename, result.error);
+        match result.status {
+            UploadStatus::Success => {
+                println!("✓ Successfully uploaded: {}", result.filename);
+            }
+            UploadStatus::Skip => {
+                println!("• Skipped (already exists): {}", result.filename);
+            }
+            UploadStatus::Error(err) => {
+                eprintln!("✗ Failed to upload {}: {:?}", result.filename, err);
+            }
         }
     }
     Ok(())
@@ -192,13 +231,13 @@ pub async fn download(base_url: String, files: Vec<String>) -> std::io::Result<(
     println!("Downloading {} files...", files.len());
     let results = client.batch_download(&files).await;
     for result in results {
-        if result.success {
-            println!("✓ Successfully downloaded: {}", result.filename);
-        } else {
-            eprintln!(
-                "✗ Failed to download {}: {:?}",
-                result.filename, result.error
-            );
+        match result.status {
+            DownloadStatus::Success => {
+                println!("✓ Successfully downloaded: {}", result.filename);
+            }
+            DownloadStatus::Error(err) => {
+                eprintln!("✗ Failed to download {}: {:?}", result.filename, err);
+            }
         }
     }
     Ok(())
@@ -240,9 +279,10 @@ mod tests {
         assert_eq!(upload_results.len(), test_files.len());
         for result in &upload_results {
             assert!(
-                result.success,
+                matches!(result.status, UploadStatus::Success),
                 "Upload failed for {}: {:?}",
-                result.filename, result.error
+                result.filename,
+                result.status
             );
         }
 
@@ -258,9 +298,10 @@ mod tests {
         // Verify the downloaded files
         for ((filename, original_content), result) in test_files.iter().zip(&download_results) {
             assert!(
-                result.success,
+                matches!(result.status, DownloadStatus::Success),
                 "Download failed for {}: {:?}",
-                filename, result.error
+                filename,
+                result.status
             );
 
             let content = fs::read(filename)?;
