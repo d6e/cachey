@@ -1,5 +1,6 @@
 use actix_web::{web, App, Error, HttpResponse, HttpServer, Result};
 use futures_util::StreamExt;
+use log::{error, info, warn};
 use num_cpus;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +46,7 @@ async fn put_cache(
 
     // Check if file already exists
     if file_path.exists() {
+        warn!("PUT conflict - key already exists: {}", key);
         return Ok(HttpResponse::Conflict()
             .content_type("text/plain")
             .body("Key already exists"));
@@ -52,32 +54,61 @@ async fn put_cache(
 
     // Create cache directory if it doesn't exist
     if !data.cache_dir.exists() {
-        fs::create_dir_all(&data.cache_dir).map_err(|e| {
-            actix_web::error::ErrorInternalServerError(format!("Failed to create directory: {}", e))
-        })?;
+        if let Err(e) = fs::create_dir_all(&data.cache_dir) {
+            error!("Failed to create directory for key {}: {}", key, e);
+            return Err(actix_web::error::ErrorInternalServerError(format!(
+                "Failed to create directory: {}",
+                e
+            )));
+        }
     }
 
     // Open file with async writer
-    let file = tokio::fs::File::create(&file_path).await.map_err(|e| {
-        actix_web::error::ErrorInternalServerError(format!("Failed to create file: {}", e))
-    })?;
+    let file = match tokio::fs::File::create(&file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to create file for key {}: {}", key, e);
+            return Err(actix_web::error::ErrorInternalServerError(format!(
+                "Failed to create file: {}",
+                e
+            )));
+        }
+    };
     let mut writer = tokio::io::BufWriter::with_capacity(BUFFER_SIZE, file);
 
     // Stream the file contents
+    let mut total_bytes = 0;
     while let Some(chunk) = payload.next().await {
-        let chunk = chunk.map_err(|e| {
-            actix_web::error::ErrorInternalServerError(format!("Failed to read chunk: {}", e))
-        })?;
-        writer.write_all(&chunk).await.map_err(|e| {
-            actix_web::error::ErrorInternalServerError(format!("Failed to write chunk: {}", e))
-        })?;
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                error!("Failed to read chunk for key {}: {}", key, e);
+                return Err(actix_web::error::ErrorInternalServerError(format!(
+                    "Failed to read chunk: {}",
+                    e
+                )));
+            }
+        };
+        total_bytes += chunk.len();
+        if let Err(e) = writer.write_all(&chunk).await {
+            error!("Failed to write chunk for key {}: {}", key, e);
+            return Err(actix_web::error::ErrorInternalServerError(format!(
+                "Failed to write chunk: {}",
+                e
+            )));
+        }
     }
 
     // Ensure all data is written to disk
-    writer.flush().await.map_err(|e| {
-        actix_web::error::ErrorInternalServerError(format!("Failed to flush file: {}", e))
-    })?;
+    if let Err(e) = writer.flush().await {
+        error!("Failed to flush file for key {}: {}", key, e);
+        return Err(actix_web::error::ErrorInternalServerError(format!(
+            "Failed to flush file: {}",
+            e
+        )));
+    }
 
+    info!("Successfully stored key {} ({} bytes)", key, total_bytes);
     Ok(HttpResponse::Created().finish())
 }
 
@@ -88,29 +119,56 @@ async fn get_cache(
     let file_path = get_file_path(&data.cache_dir, &key);
 
     if !file_path.exists() {
+        warn!("GET not found - key: {}", key);
         return Ok(HttpResponse::NotFound()
             .content_type("text/plain")
             .body("Key not found"));
     }
 
-    // Open the file
-    let file = tokio::fs::File::open(&file_path).await.map_err(|e| {
-        actix_web::error::ErrorInternalServerError(format!("Failed to open file: {}", e))
-    })?;
+    // Get file size for logging
+    let metadata = match tokio::fs::metadata(&file_path).await {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Failed to read metadata for key {}: {}", key, e);
+            return Err(actix_web::error::ErrorInternalServerError(format!(
+                "Failed to read file metadata: {}",
+                e
+            )));
+        }
+    };
 
-    // Create a streaming response
+    // Open the file
+    let file = match tokio::fs::File::open(&file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to open file for key {}: {}", key, e);
+            return Err(actix_web::error::ErrorInternalServerError(format!(
+                "Failed to open file: {}",
+                e
+            )));
+        }
+    };
+
+    info!(
+        "Successfully retrieved key {} ({} bytes)",
+        key,
+        metadata.len()
+    );
     Ok(HttpResponse::Ok().streaming(tokio_util::io::ReaderStream::new(file)))
 }
 
 pub async fn run(base_url: String) -> std::io::Result<()> {
+    // Initialize the logger with environment variables
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+
     let url_no_scheme = base_url.replace("https://", "").replace("http://", "");
     let cache_dir = PathBuf::from("cachey_cache");
     let num_workers = calculate_workers();
 
-    println!("Starting server at {}", url_no_scheme);
-    println!("Cache directory: {}", cache_dir.display());
-    println!("Number of workers: {}", num_workers);
-    println!("Total CPU cores: {}", num_cpus::get());
+    info!("Starting server at {}", url_no_scheme);
+    info!("Cache directory: {}", cache_dir.display());
+    info!("Number of workers: {}", num_workers);
+    info!("Total CPU cores: {}", num_cpus::get());
 
     HttpServer::new(move || {
         App::new()
