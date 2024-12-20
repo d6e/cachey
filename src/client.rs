@@ -222,7 +222,7 @@ impl CacheClient {
             })?;
 
         let file_size = metadata.len();
-        let mut file = tokio::fs::File::open(file_path)
+        let file = tokio::fs::File::open(file_path)
             .await
             .map_err(|e| CacheError::Io {
                 path: file_path.to_path_buf(),
@@ -269,7 +269,7 @@ impl CacheClient {
                         })?;
                 }
 
-                let mut file =
+                let file =
                     tokio::fs::File::create(output_path)
                         .await
                         .map_err(|e| CacheError::Io {

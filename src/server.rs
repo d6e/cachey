@@ -2,7 +2,6 @@ use actix_web::{web, App, Error, HttpResponse, HttpServer, Result};
 use futures_util::StreamExt;
 use log::{error, info, warn};
 use num_cpus;
-use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
