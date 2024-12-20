@@ -7,9 +7,9 @@ async fn main() -> std::io::Result<()> {
     let matches = Command::new("cachey")
         .about("An arbitrary file caching system")
         .arg(
-            Arg::new("base-url")
-                .short('b')
-                .long("base-url")
+            Arg::new("url")
+                .short('u')
+                .long("url")
                 .default_value("http://127.0.0.1:8080")
                 .help("Base URL for the cache server"),
         )
@@ -38,7 +38,7 @@ async fn main() -> std::io::Result<()> {
         .subcommand(Command::new("server").about("Server operations"))
         .get_matches();
 
-    let base_url = matches.get_one::<String>("base-url").unwrap().to_string();
+    let base_url = matches.get_one::<String>("url").unwrap().to_string();
 
     match matches.subcommand() {
         Some(("client", client_matches)) => match client_matches.subcommand() {
