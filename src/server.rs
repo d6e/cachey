@@ -1,6 +1,5 @@
 use actix_web::{web, App, Error, HttpResponse, HttpServer, Result};
 use futures_util::StreamExt;
-use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
@@ -25,11 +24,6 @@ fn calculate_workers() -> usize {
     std::cmp::min(available_cpus, max_workers).max(1)
 }
 
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
-}
-
 struct AppState {
     cache_dir: PathBuf,
 }
@@ -52,9 +46,10 @@ async fn put_cache(
 
     // Check if file already exists
     if file_path.exists() {
-        return Ok(HttpResponse::Conflict().json(ErrorResponse {
-            error: "Key already exists".to_string(),
-        }));
+        return Ok(HttpResponse::Conflict()
+                  .content_type("text/plain")
+                  .body("Key already exists"),
+        )
     }
 
     // Create cache directory if it doesn't exist
@@ -95,9 +90,9 @@ async fn get_cache(
     let file_path = get_file_path(&data.cache_dir, &key);
 
     if !file_path.exists() {
-        return Ok(HttpResponse::NotFound().json(ErrorResponse {
-            error: "Key not found".to_string(),
-        }));
+        return Ok(HttpResponse::NotFound()
+            .content_type("text/plain")
+            .body("Key not found"));
     }
 
     // Open the file

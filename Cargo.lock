@@ -400,13 +400,11 @@ version = "0.1.0"
 dependencies = [
  "actix-web",
  "anyhow",
- "bytes",
  "clap",
  "futures",
  "futures-util",
  "num_cpus",
  "reqwest",
- "serde",
  "tempfile",
  "thiserror",
  "tokio",
