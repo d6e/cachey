@@ -4,8 +4,7 @@ use reqwest::{Client, StatusCode};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, Clone)]
 pub struct CacheClientConfig {
@@ -215,34 +214,28 @@ impl CacheClient {
             return Err(CacheError::KeyExists(key));
         }
 
-        let file = File::open(file_path).await.map_err(|e| CacheError::Io {
-            path: file_path.to_path_buf(),
-            source: e,
-        })?;
-
-        let file_size = file
-            .metadata()
-            .await
-            .map_err(|e| CacheError::Io {
-                path: file_path.to_path_buf(),
-                source: e,
-            })?
-            .len();
-
-        let mut buf_reader = BufReader::with_capacity(self.config.buffer_size, file);
-        let mut buffer = Vec::with_capacity(self.config.buffer_size);
-        buf_reader
-            .read_to_end(&mut buffer)
+        let metadata = tokio::fs::metadata(file_path)
             .await
             .map_err(|e| CacheError::Io {
                 path: file_path.to_path_buf(),
                 source: e,
             })?;
 
+        let file_size = metadata.len();
+        let mut file = tokio::fs::File::open(file_path)
+            .await
+            .map_err(|e| CacheError::Io {
+                path: file_path.to_path_buf(),
+                source: e,
+            })?;
+
+        // Stream the file in chunks instead of reading it all into memory
+        let stream = tokio_util::io::ReaderStream::with_capacity(file, self.config.buffer_size);
+
         let response = self
             .client
             .put(&format!("{}/cache/{}", self.base_url, key))
-            .body(buffer)
+            .body(reqwest::Body::wrap_stream(stream))
             .header("content-length", file_size)
             .send()
             .await?;
@@ -266,20 +259,40 @@ impl CacheClient {
 
         match response.status() {
             StatusCode::OK => {
-                let mut file = File::create(output_path)
-                    .await
-                    .map_err(|e| CacheError::Io {
-                        path: output_path.to_path_buf(),
-                        source: e,
-                    })?;
+                // Create parent directories if they don't exist
+                if let Some(parent) = output_path.parent() {
+                    tokio::fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| CacheError::Io {
+                            path: parent.to_path_buf(),
+                            source: e,
+                        })?;
+                }
 
-                let mut bytes = response.bytes().await?;
-                file.write_all_buf(&mut bytes)
-                    .await
-                    .map_err(|e| CacheError::Io {
+                let mut file =
+                    tokio::fs::File::create(output_path)
+                        .await
+                        .map_err(|e| CacheError::Io {
+                            path: output_path.to_path_buf(),
+                            source: e,
+                        })?;
+
+                let mut stream = response.bytes_stream();
+                let mut writer = tokio::io::BufWriter::with_capacity(self.config.buffer_size, file);
+
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| CacheError::Http(e))?;
+                    writer.write_all(&chunk).await.map_err(|e| CacheError::Io {
                         path: output_path.to_path_buf(),
                         source: e,
                     })?;
+                }
+
+                writer.flush().await.map_err(|e| CacheError::Io {
+                    path: output_path.to_path_buf(),
+                    source: e,
+                })?;
+
                 Ok(())
             }
             StatusCode::NOT_FOUND => Err(CacheError::KeyNotFound(key.to_string())),
@@ -329,7 +342,6 @@ pub async fn download(base_url: String, files: Vec<String>) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -346,8 +358,7 @@ mod tests {
         ];
 
         for (filename, content) in &test_files {
-            let mut file = File::create(filename).await?;
-            file.write_all(*content).await?;
+            tokio::fs::write(filename, content).await?;
         }
 
         let client = CacheClient::new("http://localhost:8080".to_string());
@@ -371,7 +382,7 @@ mod tests {
 
         // Delete the original files
         for filename in &filenames {
-            fs::remove_file(filename)?;
+            tokio::fs::remove_file(filename).await?;
         }
 
         // Test batch download
@@ -387,7 +398,7 @@ mod tests {
                 result.status
             );
 
-            let content = fs::read(filename)?;
+            let content = tokio::fs::read(filename).await?;
             assert_eq!(&content, original_content);
         }
 
