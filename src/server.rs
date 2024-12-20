@@ -111,12 +111,11 @@ async fn get_cache(
 }
 
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
+pub async fn run(base_url: String) -> std::io::Result<()> {
     let cache_dir = PathBuf::from("cache");
     let num_workers = calculate_workers();
     
-    println!("Starting server at http://127.0.0.1:8080");
+    println!("Starting server at {}", base_url);
     println!("Cache directory: {}", cache_dir.display());
     println!("Number of workers: {}", num_workers);
     println!("Total CPU cores: {}", num_cpus::get());
@@ -133,7 +132,7 @@ async fn main() -> std::io::Result<()> {
                     .route(web::get().to(get_cache)),
             )
     })
-    .bind("127.0.0.1:8080")?
+    .bind(base_url)?
     .workers(num_workers)
     .run()
     .await

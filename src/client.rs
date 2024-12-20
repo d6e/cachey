@@ -6,8 +6,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use clap::{Parser, Subcommand};
-
 
 const BUFFER_SIZE: usize = 64 * 1024; // 64KB buffer for streaming
 const MAX_CONCURRENT_OPERATIONS: usize = 10;
@@ -165,65 +163,32 @@ impl CacheClient {
     }
 }
 
-#[derive(Parser)]
-#[command(author, version, about, long_about = None)]
-struct Cli {
-    /// Base URL for the cache server
-    #[arg(short, long, default_value = "http://localhost:8080")]
-    base_url: String,
+pub async fn upload(base_url: String, files: Vec<String>) -> std::io::Result<()> {
+    let client = CacheClient::new(base_url);
+    println!("Uploading {} files...", files.len());
+    let results = client.batch_upload(&files).await;
 
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Upload files to cache
-    Upload {
-        /// Files to upload
-        #[arg(required = true)]
-        files: Vec<String>,
-    },
-    /// Download files from cache
-    Download {
-        /// Files to download
-        #[arg(required = true)]
-        files: Vec<String>,
-    },
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let client = CacheClient::new(cli.base_url);
-
-    match cli.command {
-        Commands::Upload { files } => {
-            println!("Uploading {} files...", files.len());
-            let results = client.batch_upload(&files).await;
-            
-            for result in results {
-                if result.success {
-                    println!("✓ Successfully uploaded: {}", result.filename);
-                } else {
-                    eprintln!("✗ Failed to upload {}: {:?}", result.filename, result.error);
-                }
-            }
-        }
-        Commands::Download { files } => {
-            println!("Downloading {} files...", files.len());
-            let results = client.batch_download(&files).await;
-            
-            for result in results {
-                if result.success {
-                    println!("✓ Successfully downloaded: {}", result.filename);
-                } else {
-                    eprintln!("✗ Failed to download {}: {:?}", result.filename, result.error);
-                }
-            }
+    for result in results {
+        if result.success {
+            println!("✓ Successfully uploaded: {}", result.filename);
+        } else {
+            eprintln!("✗ Failed to upload {}: {:?}", result.filename, result.error);
         }
     }
+    Ok(())
+}
 
+pub async fn download(base_url: String, files: Vec<String>) -> std::io::Result<()> {
+    let client = CacheClient::new(base_url);
+    println!("Downloading {} files...", files.len());
+    let results = client.batch_download(&files).await;
+    for result in results {
+        if result.success {
+            println!("✓ Successfully downloaded: {}", result.filename);
+        } else {
+            eprintln!("✗ Failed to download {}: {:?}", result.filename, result.error);
+        }
+    }
     Ok(())
 }
 
