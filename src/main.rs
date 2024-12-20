@@ -10,7 +10,7 @@ async fn main() -> std::io::Result<()> {
             Arg::new("base-url")
                 .short('b')
                 .long("base-url")
-                .default_value("http://localhost:8080")
+                .default_value("http://127.0.0.1:8080")
                 .help("Base URL for the cache server")
         )
         .subcommand(

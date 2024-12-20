@@ -112,10 +112,11 @@ async fn get_cache(
 
 
 pub async fn run(base_url: String) -> std::io::Result<()> {
+    let url_no_scheme = base_url.replace("https://", "").replace("http://", "");
     let cache_dir = PathBuf::from("cache");
     let num_workers = calculate_workers();
     
-    println!("Starting server at {}", base_url);
+    println!("Starting server at {}", url_no_scheme);
     println!("Cache directory: {}", cache_dir.display());
     println!("Number of workers: {}", num_workers);
     println!("Total CPU cores: {}", num_cpus::get());
@@ -132,7 +133,7 @@ pub async fn run(base_url: String) -> std::io::Result<()> {
                     .route(web::get().to(get_cache)),
             )
     })
-    .bind(base_url)?
+    .bind(url_no_scheme)?
     .workers(num_workers)
     .run()
     .await
