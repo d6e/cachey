@@ -37,6 +37,16 @@ fn get_file_path(cache_dir: &Path, key: &str) -> PathBuf {
     cache_dir.join(sanitize_key(key))
 }
 
+async fn create_cache_dir_if_needed(cache_dir: &Path) -> Result<(), std::io::Error> {
+    match tokio::fs::metadata(cache_dir).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir_all(cache_dir).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
 async fn put_cache(
     key: web::Path<String>,
     mut payload: web::Payload,
@@ -45,14 +55,12 @@ async fn put_cache(
     let file_path = get_file_path(&data.cache_dir, &key);
 
     // Create cache directory if it doesn't exist
-    if !data.cache_dir.exists() {
-        if let Err(e) = fs::create_dir_all(&data.cache_dir) {
-            error!("Failed to create directory for key {}: {}", key, e);
-            return Err(actix_web::error::ErrorInternalServerError(format!(
-                "Failed to create directory: {}",
-                e
-            )));
-        }
+    if let Err(e) = create_cache_dir_if_needed(&data.cache_dir).await {
+        error!("Failed to create directory for key {}: {}", key, e);
+        return Err(actix_web::error::ErrorInternalServerError(format!(
+            "Failed to create directory: {}",
+            e
+        )));
     }
 
     // Try to create the file with OpenOptions to handle race conditions
@@ -111,14 +119,11 @@ async fn head_cache(
 ) -> Result<HttpResponse, Error> {
     let file_path = get_file_path(&data.cache_dir, &key);
 
-    if !file_path.exists() {
-        return Ok(HttpResponse::NotFound().finish());
-    }
-
     match tokio::fs::metadata(&file_path).await {
         Ok(metadata) => Ok(HttpResponse::Ok()
             .append_header(("content-length", metadata.len().to_string()))
             .finish()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HttpResponse::NotFound().finish()),
         Err(e) => {
             error!("Failed to read metadata for key {}: {}", key, e);
             Err(actix_web::error::ErrorInternalServerError(format!(
@@ -135,16 +140,15 @@ async fn get_cache(
 ) -> Result<HttpResponse, Error> {
     let file_path = get_file_path(&data.cache_dir, &key);
 
-    if !file_path.exists() {
-        warn!("GET not found - key: {}", key);
-        return Ok(HttpResponse::NotFound()
-            .content_type("text/plain")
-            .body("Key not found"));
-    }
-
-    // Get file size for logging
+    // Get metadata and handle not found case
     let metadata = match tokio::fs::metadata(&file_path).await {
         Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!("GET not found - key: {}", key);
+            return Ok(HttpResponse::NotFound()
+                .content_type("text/plain")
+                .body("Key not found"));
+        }
         Err(e) => {
             error!("Failed to read metadata for key {}: {}", key, e);
             return Err(actix_web::error::ErrorInternalServerError(format!(
