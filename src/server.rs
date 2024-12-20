@@ -1,24 +1,23 @@
 use actix_web::{web, App, Error, HttpResponse, HttpServer, Result};
 use futures_util::StreamExt;
+use num_cpus;
 use std::fs;
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
-use num_cpus;
 
 const BUFFER_SIZE: usize = 64 * 1024; // 64KB chunks for streaming
-
 
 // Function to determine optimal number of workers
 fn calculate_workers() -> usize {
     let cpu_count = num_cpus::get();
-    
+
     // Reserve at least one CPU for the OS and other processes
     let available_cpus = if cpu_count > 1 { cpu_count - 1 } else { 1 };
-    
+
     // Cap the maximum number of workers
     // This prevents excessive resource usage on many-core systems
     let max_workers = 32;
-    
+
     // Use the minimum of available CPUs and max_workers
     // Ensure at least one worker
     std::cmp::min(available_cpus, max_workers).max(1)
@@ -47,9 +46,8 @@ async fn put_cache(
     // Check if file already exists
     if file_path.exists() {
         return Ok(HttpResponse::Conflict()
-                  .content_type("text/plain")
-                  .body("Key already exists"),
-        )
+            .content_type("text/plain")
+            .body("Key already exists"));
     }
 
     // Create cache directory if it doesn't exist
@@ -101,16 +99,14 @@ async fn get_cache(
     })?;
 
     // Create a streaming response
-    Ok(HttpResponse::Ok()
-        .streaming(tokio_util::io::ReaderStream::new(file)))
+    Ok(HttpResponse::Ok().streaming(tokio_util::io::ReaderStream::new(file)))
 }
-
 
 pub async fn run(base_url: String) -> std::io::Result<()> {
     let url_no_scheme = base_url.replace("https://", "").replace("http://", "");
     let cache_dir = PathBuf::from("cache");
     let num_workers = calculate_workers();
-    
+
     println!("Starting server at {}", url_no_scheme);
     println!("Cache directory: {}", cache_dir.display());
     println!("Number of workers: {}", num_workers);

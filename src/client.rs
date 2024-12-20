@@ -56,20 +56,18 @@ impl CacheClient {
     /// Download multiple files from the cache, saving them to the current directory
     pub async fn batch_download(&self, filenames: &[String]) -> Vec<BatchResult> {
         let mut results = Vec::new();
-        
-        let mut downloads = futures::stream::iter(
-            filenames.iter().map(|filename| {
-                let filename = filename.clone();
-                async move {
-                    let result = self.get_file(&filename, Path::new(&filename)).await;
-                    BatchResult {
-                        filename: filename.clone(),
-                        success: result.is_ok(),
-                        error: result.err(),
-                    }
+
+        let mut downloads = futures::stream::iter(filenames.iter().map(|filename| {
+            let filename = filename.clone();
+            async move {
+                let result = self.get_file(&filename, Path::new(&filename)).await;
+                BatchResult {
+                    filename: filename.clone(),
+                    success: result.is_ok(),
+                    error: result.err(),
                 }
-            })
-        )
+            }
+        }))
         .buffer_unordered(MAX_CONCURRENT_OPERATIONS);
 
         while let Some(result) = downloads.next().await {
@@ -81,20 +79,18 @@ impl CacheClient {
     /// Upload multiple files to the cache from the current directory
     pub async fn batch_upload(&self, filenames: &[String]) -> Vec<BatchResult> {
         let mut results = Vec::new();
-        
-        let mut uploads = futures_util::stream::iter(
-            filenames.iter().map(|filename| {
-                let filename = filename.clone();
-                async move {
-                    let result = self.put_file(&filename, Path::new(&filename)).await;
-                    BatchResult {
-                        filename: filename.clone(),
-                        success: result.is_ok(),
-                        error: result.err(),
-                    }
+
+        let mut uploads = futures_util::stream::iter(filenames.iter().map(|filename| {
+            let filename = filename.clone();
+            async move {
+                let result = self.put_file(&filename, Path::new(&filename)).await;
+                BatchResult {
+                    filename: filename.clone(),
+                    success: result.is_ok(),
+                    error: result.err(),
                 }
-            })
-        )
+            }
+        }))
         .buffer_unordered(MAX_CONCURRENT_OPERATIONS);
 
         while let Some(result) = uploads.next().await {
@@ -110,19 +106,27 @@ impl CacheClient {
             source: e,
         })?;
 
-        let file_size = file.metadata().await.map_err(|e| CacheError::Io {
-            path: file_path.to_path_buf(),
-            source: e,
-        })?.len();
+        let file_size = file
+            .metadata()
+            .await
+            .map_err(|e| CacheError::Io {
+                path: file_path.to_path_buf(),
+                source: e,
+            })?
+            .len();
 
         let mut buf_reader = BufReader::with_capacity(BUFFER_SIZE, file);
         let mut buffer = Vec::with_capacity(BUFFER_SIZE);
-        buf_reader.read_to_end(&mut buffer).await.map_err(|e| CacheError::Io {
-            path: file_path.to_path_buf(),
-            source: e,
-        })?;
+        buf_reader
+            .read_to_end(&mut buffer)
+            .await
+            .map_err(|e| CacheError::Io {
+                path: file_path.to_path_buf(),
+                source: e,
+            })?;
 
-        let response = self.client
+        let response = self
+            .client
             .put(&format!("{}/cache/{}", self.base_url, key))
             .body(buffer)
             .header("content-length", file_size)
@@ -137,23 +141,28 @@ impl CacheClient {
     }
 
     async fn get_file(&self, key: &str, output_path: &Path) -> Result<(), CacheError> {
-        let response = self.client
+        let response = self
+            .client
             .get(&format!("{}/cache/{}", self.base_url, key))
             .send()
             .await?;
 
         match response.status() {
             StatusCode::OK => {
-                let mut file = File::create(output_path).await.map_err(|e| CacheError::Io {
-                    path: output_path.to_path_buf(),
-                    source: e,
-                })?;
+                let mut file = File::create(output_path)
+                    .await
+                    .map_err(|e| CacheError::Io {
+                        path: output_path.to_path_buf(),
+                        source: e,
+                    })?;
 
                 let mut bytes = response.bytes().await?;
-                file.write_all_buf(&mut bytes).await.map_err(|e| CacheError::Io {
-                    path: output_path.to_path_buf(),
-                    source: e,
-                })?;
+                file.write_all_buf(&mut bytes)
+                    .await
+                    .map_err(|e| CacheError::Io {
+                        path: output_path.to_path_buf(),
+                        source: e,
+                    })?;
 
                 Ok(())
             }
@@ -186,7 +195,10 @@ pub async fn download(base_url: String, files: Vec<String>) -> std::io::Result<(
         if result.success {
             println!("✓ Successfully downloaded: {}", result.filename);
         } else {
-            eprintln!("✗ Failed to download {}: {:?}", result.filename, result.error);
+            eprintln!(
+                "✗ Failed to download {}: {:?}",
+                result.filename, result.error
+            );
         }
     }
     Ok(())
@@ -195,8 +207,8 @@ pub async fn download(base_url: String, files: Vec<String>) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_batch_operations() -> Result<()> {
@@ -219,14 +231,19 @@ mod tests {
         let client = CacheClient::new("http://localhost:8080".to_string());
 
         // Test batch upload
-        let filenames: Vec<String> = test_files.iter()
+        let filenames: Vec<String> = test_files
+            .iter()
             .map(|(name, _)| name.to_string())
             .collect();
 
         let upload_results = client.batch_upload(&filenames).await;
         assert_eq!(upload_results.len(), test_files.len());
         for result in &upload_results {
-            assert!(result.success, "Upload failed for {}: {:?}", result.filename, result.error);
+            assert!(
+                result.success,
+                "Upload failed for {}: {:?}",
+                result.filename, result.error
+            );
         }
 
         // Delete the original files
@@ -237,15 +254,19 @@ mod tests {
         // Test batch download
         let download_results = client.batch_download(&filenames).await;
         assert_eq!(download_results.len(), test_files.len());
-        
+
         // Verify the downloaded files
         for ((filename, original_content), result) in test_files.iter().zip(&download_results) {
-            assert!(result.success, "Download failed for {}: {:?}", filename, result.error);
-            
+            assert!(
+                result.success,
+                "Download failed for {}: {:?}",
+                filename, result.error
+            );
+
             let content = fs::read(filename)?;
             assert_eq!(&content, original_content);
         }
 
         Ok(())
-    }}
-
+    }
+}
