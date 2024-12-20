@@ -83,7 +83,7 @@ impl CacheClient {
         Self::with_config(base_url, CacheClientConfig::default())
     }
 
-    pub fn with_config(base_url: String, config: CacheClientConfig) -> Self {
+    pub fn with_config(mut base_url: String, config: CacheClientConfig) -> Self {
         let client = Client::builder()
             .pool_max_idle_per_host(config.max_idle_per_host)
             .pool_idle_timeout(config.pool_idle_timeout)
@@ -91,6 +91,9 @@ impl CacheClient {
             .tcp_keepalive(config.keep_alive_timeout)
             .build()
             .expect("Failed to create HTTP client");
+        if !base_url.starts_with("http") {
+            base_url = format!("http://{}", base_url);
+        }
 
         Self {
             client,
@@ -116,36 +119,39 @@ impl CacheClient {
         let total_files = filenames.len();
         let mut processed = 0;
 
-        let mut downloads = futures::stream::iter(filenames.iter().map(|filename| {
-            let filename = filename.clone();
-            async move {
-                let result = match tokio::time::timeout(
-                    self.config.operation_timeout,
-                    self.get_file(&filename, Path::new(&filename)),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => BatchResultDownload {
-                        filename: filename.clone(),
-                        status: DownloadStatus::Success,
-                    },
-                    Ok(Err(e)) => BatchResultDownload {
-                        filename: filename.clone(),
-                        status: DownloadStatus::Error(e),
-                    },
-                    Err(_) => BatchResultDownload {
-                        filename: filename.clone(),
-                        status: DownloadStatus::Error(CacheError::Server(
-                            "Operation timed out".to_string(),
-                        )),
-                    },
-                };
-                processed += 1;
-                if processed % 10 == 0 || processed == total_files {
-                    println!("Progress: {}/{} files processed", processed, total_files);
-                }
-                result
+        let mut downloads = futures::stream::iter(filenames.iter().map(|filename| async move {
+            let filename = filename;
+            let key = Path::new(&filename)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let result = match tokio::time::timeout(
+                self.config.operation_timeout,
+                self.get_file(&key, Path::new(&filename)),
+            )
+            .await
+            {
+                Ok(Ok(_)) => BatchResultDownload {
+                    filename: filename.clone(),
+                    status: DownloadStatus::Success,
+                },
+                Ok(Err(e)) => BatchResultDownload {
+                    filename: filename.clone(),
+                    status: DownloadStatus::Error(e),
+                },
+                Err(_) => BatchResultDownload {
+                    filename: filename.clone(),
+                    status: DownloadStatus::Error(CacheError::Server(
+                        "Operation timed out".to_string(),
+                    )),
+                },
+            };
+            processed += 1;
+            if processed % 10 == 0 || processed == total_files {
+                println!("Progress: {}/{} files processed", processed, total_files);
             }
+            result
         }))
         .buffer_unordered(self.config.max_concurrent_operations);
 
@@ -251,11 +257,8 @@ impl CacheClient {
     }
 
     async fn get_file(&self, key: &str, output_path: &Path) -> Result<(), CacheError> {
-        let response = self
-            .client
-            .get(&format!("{}/cache/{}", self.base_url, key))
-            .send()
-            .await?;
+        let url = format!("{}/cache/{}", self.base_url, key);
+        let response = self.client.get(&url).send().await?;
 
         match response.status() {
             StatusCode::OK => {
