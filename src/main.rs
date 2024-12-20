@@ -1,6 +1,5 @@
+use cachey::{client, server};
 use clap::{Arg, Command};
-mod client;
-mod server;
 
 fn build_cli() -> Command {
     Command::new("cachey")
