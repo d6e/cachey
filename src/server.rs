@@ -104,7 +104,7 @@ async fn get_cache(
 
 pub async fn run(base_url: String) -> std::io::Result<()> {
     let url_no_scheme = base_url.replace("https://", "").replace("http://", "");
-    let cache_dir = PathBuf::from("cache");
+    let cache_dir = PathBuf::from("cachey_cache");
     let num_workers = calculate_workers();
 
     println!("Starting server at {}", url_no_scheme);
