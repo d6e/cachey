@@ -358,13 +358,13 @@ pub async fn upload(base_url: String, files: Vec<String>) -> std::io::Result<()>
     for result in results {
         match result.status {
             UploadStatus::Success => {
-                println!("✓ Successfully uploaded: {}", result.filename);
+                println!("✓ Uploaded: {}", result.filename);
             }
             UploadStatus::Skip => {
-                println!("• Skipped (already exists): {}", result.filename);
+                println!("• Skipped: {}", result.filename);
             }
             UploadStatus::Error(err) => {
-                eprintln!("✗ Failed to upload {}: {:?}", result.filename, err);
+                eprintln!("✗ Failed: {} {:?}", result.filename, err);
             }
         }
     }
@@ -378,13 +378,13 @@ pub async fn download(base_url: String, files: Vec<String>) -> std::io::Result<(
     for result in results {
         match result.status {
             DownloadStatus::Success => {
-                println!("✓ Successfully downloaded: {}", result.filename);
+                println!("✓ Downloaded: {}", result.filename);
             }
             DownloadStatus::Skip => {
-                println!("• Skipped (already exists): {}", result.filename);
+                println!("• Skipped: {}", result.filename);
             }
             DownloadStatus::Error(err) => {
-                eprintln!("✗ Failed to download {}: {:?}", result.filename, err);
+                eprintln!("✗ Failed: {} {:?}", result.filename, err);
             }
         }
     }
