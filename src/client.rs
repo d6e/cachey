@@ -49,6 +49,7 @@ pub enum CacheError {
 #[derive(Debug)]
 pub enum DownloadStatus {
     Success,
+    Skip,
     Error(CacheError),
 }
 
@@ -113,6 +114,46 @@ impl CacheClient {
         Ok(response.status() == StatusCode::OK)
     }
 
+    /// Check if a file exists and matches the remote content length
+    async fn should_skip_download(
+        &self,
+        key: &str,
+        output_path: &Path,
+    ) -> Result<bool, CacheError> {
+        // First check if file exists locally
+        if !output_path.exists() {
+            return Ok(false);
+        }
+
+        // Get local file size
+        let local_metadata =
+            tokio::fs::metadata(output_path)
+                .await
+                .map_err(|e| CacheError::Io {
+                    path: output_path.to_path_buf(),
+                    source: e,
+                })?;
+        let local_size = local_metadata.len();
+
+        // Get remote file size with HEAD request
+        let response = self
+            .client
+            .head(&format!("{}/cache/{}", self.base_url, key))
+            .send()
+            .await?;
+
+        if response.status() != StatusCode::OK {
+            return Ok(false);
+        }
+
+        // Compare content lengths
+        if let Some(content_length) = response.content_length() {
+            Ok(content_length == local_size)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Download multiple files from the cache, saving them to the current directory
     pub async fn batch_download(&self, filenames: &[String]) -> Vec<BatchResultDownload> {
         let mut results = Vec::with_capacity(filenames.len());
@@ -132,9 +173,9 @@ impl CacheClient {
             )
             .await
             {
-                Ok(Ok(_)) => BatchResultDownload {
+                Ok(Ok(status)) => BatchResultDownload {
                     filename: filename.clone(),
-                    status: DownloadStatus::Success,
+                    status,
                 },
                 Ok(Err(e)) => BatchResultDownload {
                     filename: filename.clone(),
@@ -256,7 +297,12 @@ impl CacheClient {
         }
     }
 
-    async fn get_file(&self, key: &str, output_path: &Path) -> Result<(), CacheError> {
+    async fn get_file(&self, key: &str, output_path: &Path) -> Result<DownloadStatus, CacheError> {
+        // Check if we can skip the download
+        if self.should_skip_download(key, output_path).await? {
+            return Ok(DownloadStatus::Skip);
+        }
+
         let url = format!("{}/cache/{}", self.base_url, key);
         let response = self.client.get(&url).send().await?;
 
@@ -296,7 +342,7 @@ impl CacheClient {
                     source: e,
                 })?;
 
-                Ok(())
+                Ok(DownloadStatus::Success)
             }
             StatusCode::NOT_FOUND => Err(CacheError::KeyNotFound(key.to_string())),
             status => Err(CacheError::Server(format!("Unexpected status: {}", status))),
@@ -333,6 +379,9 @@ pub async fn download(base_url: String, files: Vec<String>) -> std::io::Result<(
         match result.status {
             DownloadStatus::Success => {
                 println!("✓ Successfully downloaded: {}", result.filename);
+            }
+            DownloadStatus::Skip => {
+                println!("• Skipped (already exists): {}", result.filename);
             }
             DownloadStatus::Error(err) => {
                 eprintln!("✗ Failed to download {}: {:?}", result.filename, err);
@@ -403,6 +452,20 @@ mod tests {
 
             let content = tokio::fs::read(filename).await?;
             assert_eq!(&content, original_content);
+        }
+
+        // Test skipping existing files
+        let second_download = client.batch_download(&filenames).await;
+        assert_eq!(second_download.len(), test_files.len());
+
+        // Verify all files were skipped
+        for result in &second_download {
+            assert!(
+                matches!(result.status, DownloadStatus::Skip),
+                "File should have been skipped: {}: {:?}",
+                result.filename,
+                result.status
+            );
         }
 
         Ok(())
