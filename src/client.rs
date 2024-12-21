@@ -157,8 +157,6 @@ impl CacheClient {
     /// Download multiple files from the cache, saving them to the current directory
     pub async fn batch_download(&self, filenames: &[String]) -> Vec<BatchResultDownload> {
         let mut results = Vec::with_capacity(filenames.len());
-        let total_files = filenames.len();
-        let mut processed = 0;
 
         let mut downloads = futures::stream::iter(filenames.iter().map(|filename| async move {
             let filename = filename;
@@ -167,31 +165,43 @@ impl CacheClient {
                 .unwrap()
                 .to_string_lossy()
                 .to_string();
+
             let result = match tokio::time::timeout(
                 self.config.operation_timeout,
                 self.get_file(&key, Path::new(&filename)),
             )
             .await
             {
-                Ok(Ok(status)) => BatchResultDownload {
-                    filename: filename.clone(),
-                    status,
-                },
-                Ok(Err(e)) => BatchResultDownload {
-                    filename: filename.clone(),
-                    status: DownloadStatus::Error(e),
-                },
-                Err(_) => BatchResultDownload {
-                    filename: filename.clone(),
-                    status: DownloadStatus::Error(CacheError::Server(
-                        "Operation timed out".to_string(),
-                    )),
-                },
+                Ok(Ok(status)) => {
+                    match status {
+                        DownloadStatus::Success => println!("✓ Downloaded: {}", filename),
+                        DownloadStatus::Skip => println!("• Skipped: {}", filename),
+                        DownloadStatus::Error(ref err) => {
+                            eprintln!("✗ Failed: {} {:?}", filename, err)
+                        }
+                    }
+                    BatchResultDownload {
+                        filename: filename.clone(),
+                        status,
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("✗ Failed: {} {:?}", filename, e);
+                    BatchResultDownload {
+                        filename: filename.clone(),
+                        status: DownloadStatus::Error(e),
+                    }
+                }
+                Err(_) => {
+                    eprintln!("✗ Failed: {} Operation timed out", filename);
+                    BatchResultDownload {
+                        filename: filename.clone(),
+                        status: DownloadStatus::Error(CacheError::Server(
+                            "Operation timed out".to_string(),
+                        )),
+                    }
+                }
             };
-            processed += 1;
-            if processed % 10 == 0 || processed == total_files {
-                println!("Progress: {}/{} files processed", processed, total_files);
-            }
             result
         }))
         .buffer_unordered(self.config.max_concurrent_operations);
@@ -206,8 +216,6 @@ impl CacheClient {
     /// Upload multiple files to the cache from the current directory
     pub async fn batch_upload(&self, filenames: &[String]) -> Vec<BatchResultUpload> {
         let mut results = Vec::with_capacity(filenames.len());
-        let total_files = filenames.len();
-        let mut processed = 0;
 
         let mut uploads = futures_util::stream::iter(filenames.iter().map(|filename| {
             let filename = filename.clone();
@@ -218,29 +226,37 @@ impl CacheClient {
                 )
                 .await
                 {
-                    Ok(Ok(_)) => BatchResultUpload {
-                        filename: filename.clone(),
-                        status: UploadStatus::Success,
-                    },
-                    Ok(Err(CacheError::KeyExists(_))) => BatchResultUpload {
-                        filename: filename.clone(),
-                        status: UploadStatus::Skip,
-                    },
-                    Ok(Err(e)) => BatchResultUpload {
-                        filename: filename.clone(),
-                        status: UploadStatus::Error(e),
-                    },
-                    Err(_) => BatchResultUpload {
-                        filename: filename.clone(),
-                        status: UploadStatus::Error(CacheError::Server(
-                            "Operation timed out".to_string(),
-                        )),
-                    },
+                    Ok(Ok(_)) => {
+                        println!("✓ Uploaded: {}", filename);
+                        BatchResultUpload {
+                            filename: filename.clone(),
+                            status: UploadStatus::Success,
+                        }
+                    }
+                    Ok(Err(CacheError::KeyExists(_))) => {
+                        println!("• Skipped: {}", filename);
+                        BatchResultUpload {
+                            filename: filename.clone(),
+                            status: UploadStatus::Skip,
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("✗ Failed: {} {:?}", filename, e);
+                        BatchResultUpload {
+                            filename: filename.clone(),
+                            status: UploadStatus::Error(e),
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!("✗ Failed: {} Operation timed out", filename);
+                        BatchResultUpload {
+                            filename: filename.clone(),
+                            status: UploadStatus::Error(CacheError::Server(
+                                "Operation timed out".to_string(),
+                            )),
+                        }
+                    }
                 };
-                processed += 1;
-                if processed % 10 == 0 || processed == total_files {
-                    println!("Progress: {}/{} files processed", processed, total_files);
-                }
                 result
             }
         }))
@@ -354,20 +370,6 @@ pub async fn upload(base_url: String, files: Vec<String>) -> std::io::Result<()>
     let client = CacheClient::new(base_url);
     println!("Uploading {} files...", files.len());
     let results = client.batch_upload(&files).await;
-
-    for result in results {
-        match result.status {
-            UploadStatus::Success => {
-                println!("✓ Uploaded: {}", result.filename);
-            }
-            UploadStatus::Skip => {
-                println!("• Skipped: {}", result.filename);
-            }
-            UploadStatus::Error(err) => {
-                eprintln!("✗ Failed: {} {:?}", result.filename, err);
-            }
-        }
-    }
     Ok(())
 }
 
@@ -375,19 +377,6 @@ pub async fn download(base_url: String, files: Vec<String>) -> std::io::Result<(
     let client = CacheClient::new(base_url);
     println!("Downloading {} files...", files.len());
     let results = client.batch_download(&files).await;
-    for result in results {
-        match result.status {
-            DownloadStatus::Success => {
-                println!("✓ Downloaded: {}", result.filename);
-            }
-            DownloadStatus::Skip => {
-                println!("• Skipped: {}", result.filename);
-            }
-            DownloadStatus::Error(err) => {
-                eprintln!("✗ Failed: {} {:?}", result.filename, err);
-            }
-        }
-    }
     Ok(())
 }
 
@@ -445,7 +434,7 @@ mod tests {
         for ((filename, original_content), result) in test_files.iter().zip(&download_results) {
             assert!(
                 matches!(result.status, DownloadStatus::Success),
-                "Download failed for {}: {:?}",
+                "                Download failed for {}: {:?}",
                 filename,
                 result.status
             );
