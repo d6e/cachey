@@ -79,11 +79,12 @@ pub struct CacheClient {
 }
 
 impl CacheClient {
-    /// Create a new cache client with optimized settings
+    /// Create a new cache client with default settings
     pub fn new(base_url: String) -> Self {
         Self::with_config(base_url, CacheClientConfig::default())
     }
 
+    /// Create a new cache client with custom configuration
     pub fn with_config(mut base_url: String, config: CacheClientConfig) -> Self {
         let client = Client::builder()
             .pool_max_idle_per_host(config.max_idle_per_host)
@@ -92,6 +93,7 @@ impl CacheClient {
             .tcp_keepalive(config.keep_alive_timeout)
             .build()
             .expect("Failed to create HTTP client");
+
         if !base_url.starts_with("http") {
             base_url = format!("http://{}", base_url);
         }
@@ -100,6 +102,17 @@ impl CacheClient {
             client,
             base_url,
             config,
+        }
+    }
+
+    /// Helper function to format error messages
+    fn format_error(&self, err: &CacheError) -> String {
+        match err {
+            CacheError::KeyNotFound(_) => String::from("File not found on server"),
+            CacheError::KeyExists(_) => String::from("File already exists on server"),
+            CacheError::Server(msg) => format!("Server error: {}", msg),
+            CacheError::Http(e) => format!("Network error: {}", e),
+            CacheError::Io { path: _, source } => format!("IO error: {}", source),
         }
     }
 
@@ -177,7 +190,7 @@ impl CacheClient {
                         DownloadStatus::Success => println!("✓ Downloaded: {}", filename),
                         DownloadStatus::Skip => println!("• Skipped: {}", filename),
                         DownloadStatus::Error(ref err) => {
-                            eprintln!("✗ Failed: {} {:?}", filename, err)
+                            eprintln!("✗ Failed({}): {}", self.format_error(err), filename)
                         }
                     }
                     BatchResultDownload {
@@ -186,14 +199,14 @@ impl CacheClient {
                     }
                 }
                 Ok(Err(e)) => {
-                    eprintln!("✗ Failed: {} {:?}", filename, e);
+                    eprintln!("✗ Failed({}): {}", self.format_error(&e), filename);
                     BatchResultDownload {
                         filename: filename.clone(),
                         status: DownloadStatus::Error(e),
                     }
                 }
                 Err(_) => {
-                    eprintln!("✗ Failed: {} Operation timed out", filename);
+                    eprintln!("✗ Failed(Operation timed out): {}", filename);
                     BatchResultDownload {
                         filename: filename.clone(),
                         status: DownloadStatus::Error(CacheError::Server(
@@ -241,14 +254,14 @@ impl CacheClient {
                         }
                     }
                     Ok(Err(e)) => {
-                        eprintln!("✗ Failed: {} {:?}", filename, e);
+                        eprintln!("✗ Failed({}): {}", self.format_error(&e), filename);
                         BatchResultUpload {
                             filename: filename.clone(),
                             status: UploadStatus::Error(e),
                         }
                     }
                     Err(_) => {
-                        eprintln!("✗ Failed: {} Operation timed out", filename);
+                        eprintln!("✗ Failed(Operation timed out): {}", filename);
                         BatchResultUpload {
                             filename: filename.clone(),
                             status: UploadStatus::Error(CacheError::Server(
@@ -305,10 +318,7 @@ impl CacheClient {
 
         match response.status() {
             StatusCode::CREATED => Ok(()),
-            StatusCode::CONFLICT => {
-                // This should rarely happen now since we check first
-                Err(CacheError::KeyExists(key.to_string()))
-            }
+            StatusCode::CONFLICT => Err(CacheError::KeyExists(key.to_string())),
             status => Err(CacheError::Server(format!("Unexpected status: {}", status))),
         }
     }
@@ -434,7 +444,7 @@ mod tests {
         for ((filename, original_content), result) in test_files.iter().zip(&download_results) {
             assert!(
                 matches!(result.status, DownloadStatus::Success),
-                "                Download failed for {}: {:?}",
+                "Download failed for {}: {:?}",
                 filename,
                 result.status
             );
