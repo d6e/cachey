@@ -36,6 +36,8 @@ pub enum CacheError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("Connection error: {0}")]
+    Connection(String),
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("Key already exists: {0}")]
@@ -111,8 +113,18 @@ impl CacheClient {
             CacheError::KeyNotFound(_) => String::from("File not found on server"),
             CacheError::KeyExists(_) => String::from("File already exists on server"),
             CacheError::Server(msg) => format!("Server error: {}", msg),
+            CacheError::Connection(msg) => format!("Connection error: {}", msg),
             CacheError::Http(e) => format!("Network error: {}", e),
             CacheError::Io { path: _, source } => format!("IO error: {}", source),
+        }
+    }
+
+    /// Check if an error is a connection error
+    fn is_connection_error(&self, error: &CacheError) -> bool {
+        match error {
+            CacheError::Http(e) => e.is_connect() || e.is_timeout(),
+            CacheError::Connection(_) => true,
+            _ => false,
         }
     }
 
@@ -190,6 +202,9 @@ impl CacheClient {
                         DownloadStatus::Success => println!("✓ Downloaded: {}", filename),
                         DownloadStatus::Skip => println!("• Skipped: {}", filename),
                         DownloadStatus::Error(ref err) => {
+                            if self.is_connection_error(err) {
+                                panic!("Fatal connection error: {}", self.format_error(err));
+                            }
                             eprintln!("✗ Failed({}): {}", self.format_error(err), filename)
                         }
                     }
@@ -199,6 +214,9 @@ impl CacheClient {
                     }
                 }
                 Ok(Err(e)) => {
+                    if self.is_connection_error(&e) {
+                        panic!("Fatal connection error: {}", self.format_error(&e));
+                    }
                     eprintln!("✗ Failed({}): {}", self.format_error(&e), filename);
                     BatchResultDownload {
                         filename: filename.clone(),
@@ -206,13 +224,11 @@ impl CacheClient {
                     }
                 }
                 Err(_) => {
-                    eprintln!("✗ Failed(Operation timed out): {}", filename);
-                    BatchResultDownload {
-                        filename: filename.clone(),
-                        status: DownloadStatus::Error(CacheError::Server(
-                            "Operation timed out".to_string(),
-                        )),
-                    }
+                    let timeout_error = CacheError::Connection("Operation timed out".to_string());
+                    panic!(
+                        "Fatal connection error: {}",
+                        self.format_error(&timeout_error)
+                    );
                 }
             };
             result
@@ -254,6 +270,9 @@ impl CacheClient {
                         }
                     }
                     Ok(Err(e)) => {
+                        if self.is_connection_error(&e) {
+                            panic!("Fatal connection error: {}", self.format_error(&e));
+                        }
                         eprintln!("✗ Failed({}): {}", self.format_error(&e), filename);
                         BatchResultUpload {
                             filename: filename.clone(),
@@ -261,13 +280,12 @@ impl CacheClient {
                         }
                     }
                     Err(_) => {
-                        eprintln!("✗ Failed(Operation timed out): {}", filename);
-                        BatchResultUpload {
-                            filename: filename.clone(),
-                            status: UploadStatus::Error(CacheError::Server(
-                                "Operation timed out".to_string(),
-                            )),
-                        }
+                        let timeout_error =
+                            CacheError::Connection("Operation timed out".to_string());
+                        panic!(
+                            "Fatal connection error: {}",
+                            self.format_error(&timeout_error)
+                        );
                     }
                 };
                 result
