@@ -379,14 +379,14 @@ impl CacheClient {
 pub async fn upload(base_url: String, files: Vec<String>) -> std::io::Result<()> {
     let client = CacheClient::new(base_url);
     println!("Uploading {} files...", files.len());
-    let results = client.batch_upload(&files).await;
+    client.batch_upload(&files).await;
     Ok(())
 }
 
 pub async fn download(base_url: String, files: Vec<String>) -> std::io::Result<()> {
     let client = CacheClient::new(base_url);
     println!("Downloading {} files...", files.len());
-    let results = client.batch_download(&files).await;
+    client.batch_download(&files).await;
     Ok(())
 }
 
