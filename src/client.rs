@@ -189,40 +189,32 @@ impl CacheClient {
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
-                .to_string();
-
-            let result = match tokio::time::timeout(
-                self.config.operation_timeout,
-                self.get_file(&key, Path::new(&filename)),
-            )
-            .await
-            {
-                Ok(Ok(status)) => {
-                    match status {
-                        DownloadStatus::Success => println!("✓ Downloaded: {}", filename),
-                        DownloadStatus::Skip => println!("• Skipped: {}", filename),
-                        DownloadStatus::Error(ref err) => {
+                .to_string();                let result = match tokio::time::timeout(
+                    self.config.operation_timeout,
+                    self.get_file(&key, Path::new(&filename)),
+                )
+                .await
+                {
+                    Ok(Ok(status)) => {
+                        if let DownloadStatus::Error(ref err) = status {
                             if self.is_connection_error(err) {
                                 panic!("Fatal connection error: {}", self.format_error(err));
                             }
-                            eprintln!("✗ Failed({}): {}", self.format_error(err), filename)
+                        }
+                        BatchResultDownload {
+                            filename: filename.clone(),
+                            status,
                         }
                     }
-                    BatchResultDownload {
-                        filename: filename.clone(),
-                        status,
+                    Ok(Err(e)) => {
+                        if self.is_connection_error(&e) {
+                            panic!("Fatal connection error: {}", self.format_error(&e));
+                        }
+                        BatchResultDownload {
+                            filename: filename.clone(),
+                            status: DownloadStatus::Error(e),
+                        }
                     }
-                }
-                Ok(Err(e)) => {
-                    if self.is_connection_error(&e) {
-                        panic!("Fatal connection error: {}", self.format_error(&e));
-                    }
-                    eprintln!("✗ Failed({}): {}", self.format_error(&e), filename);
-                    BatchResultDownload {
-                        filename: filename.clone(),
-                        status: DownloadStatus::Error(e),
-                    }
-                }
                 Err(_) => {
                     let timeout_error = CacheError::Connection("Operation timed out".to_string());
                     panic!(
@@ -255,25 +247,18 @@ impl CacheClient {
                 )
                 .await
                 {
-                    Ok(Ok(_)) => {
-                        println!("✓ Uploaded: {}", filename);
-                        BatchResultUpload {
-                            filename: filename.clone(),
-                            status: UploadStatus::Success,
-                        }
-                    }
-                    Ok(Err(CacheError::KeyExists(_))) => {
-                        println!("• Skipped: {}", filename);
-                        BatchResultUpload {
-                            filename: filename.clone(),
-                            status: UploadStatus::Skip,
-                        }
-                    }
+                    Ok(Ok(_)) => BatchResultUpload {
+                        filename: filename.clone(),
+                        status: UploadStatus::Success,
+                    },
+                    Ok(Err(CacheError::KeyExists(_))) => BatchResultUpload {
+                        filename: filename.clone(),
+                        status: UploadStatus::Skip,
+                    },
                     Ok(Err(e)) => {
                         if self.is_connection_error(&e) {
                             panic!("Fatal connection error: {}", self.format_error(&e));
                         }
-                        eprintln!("✗ Failed({}): {}", self.format_error(&e), filename);
                         BatchResultUpload {
                             filename: filename.clone(),
                             status: UploadStatus::Error(e),
@@ -394,16 +379,50 @@ impl CacheClient {
     }
 }
 
-pub async fn upload(base_url: String, files: Vec<String>) -> std::io::Result<()> {
+pub async fn upload(base_url: String, files: Vec<String>, verbose: bool) -> std::io::Result<()> {
     let client = CacheClient::new(base_url);
     println!("Uploading {} files...", files.len());
-    client.batch_upload(&files).await;
+    let results = client.batch_upload(&files).await;
+    
+    // Print summary
+    let success_count = results.iter().filter(|r| matches!(r.status, UploadStatus::Success)).count();
+    let skip_count = results.iter().filter(|r| matches!(r.status, UploadStatus::Skip)).count();
+    let error_count = results.iter().filter(|r| matches!(r.status, UploadStatus::Error(_))).count();
+    
+    if verbose {
+        for result in &results {
+            match &result.status {
+                UploadStatus::Success => println!("✓ Uploaded: {}", result.filename),
+                UploadStatus::Skip => println!("• Skipped: {}", result.filename),
+                UploadStatus::Error(err) => eprintln!("✗ Failed({}): {}", client.format_error(err), result.filename),
+            }
+        }
+    }
+    
+    println!("\nSummary: {} uploaded, {} skipped, {} failed", success_count, skip_count, error_count);
     Ok(())
 }
 
-pub async fn download(base_url: String, files: Vec<String>) -> std::io::Result<()> {
+pub async fn download(base_url: String, files: Vec<String>, verbose: bool) -> std::io::Result<()> {
     let client = CacheClient::new(base_url);
     println!("Downloading {} files...", files.len());
-    client.batch_download(&files).await;
+    let results = client.batch_download(&files).await;
+    
+    // Print summary
+    let success_count = results.iter().filter(|r| matches!(r.status, DownloadStatus::Success)).count();
+    let skip_count = results.iter().filter(|r| matches!(r.status, DownloadStatus::Skip)).count();
+    let error_count = results.iter().filter(|r| matches!(r.status, DownloadStatus::Error(_))).count();
+    
+    if verbose {
+        for result in &results {
+            match &result.status {
+                DownloadStatus::Success => println!("✓ Downloaded: {}", result.filename),
+                DownloadStatus::Skip => println!("• Skipped: {}", result.filename),
+                DownloadStatus::Error(err) => eprintln!("✗ Failed({}): {}", client.format_error(err), result.filename),
+            }
+        }
+    }
+    
+    println!("\nSummary: {} downloaded, {} skipped, {} failed", success_count, skip_count, error_count);
     Ok(())
 }

@@ -11,6 +11,13 @@ fn build_cli() -> Command {
                 .default_value("http://127.0.0.1:8080")
                 .help("Base URL for the cache server"),
         )
+        .arg(
+            Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .help("Print detailed progress information")
+                .action(clap::ArgAction::SetTrue),
+        )
         .subcommand(
             Command::new("client")
                 .about("Client operations")
@@ -42,6 +49,7 @@ async fn main() -> std::io::Result<()> {
     let matches = main_cmd.clone().get_matches();
 
     let base_url = matches.get_one::<String>("url").unwrap().clone();
+    let verbose = matches.get_flag("verbose");
 
     match matches.subcommand() {
         Some(("client", client_matches)) => {
@@ -52,7 +60,7 @@ async fn main() -> std::io::Result<()> {
                         .unwrap()
                         .cloned()
                         .collect();
-                    client::upload(base_url, files).await
+                    client::upload(base_url, files, verbose).await
                 }
                 Some(("download", download_matches)) => {
                     let files: Vec<_> = download_matches
@@ -60,7 +68,7 @@ async fn main() -> std::io::Result<()> {
                         .unwrap()
                         .cloned()
                         .collect();
-                    client::download(base_url, files).await
+                    client::download(base_url, files, verbose).await
                 }
                 // If 'client' is used without specifying upload/download,
                 // print the help for the 'client' subcommand.
