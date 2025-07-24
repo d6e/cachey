@@ -14,6 +14,10 @@ pub struct CacheClientConfig {
     pub keep_alive_timeout: Duration,
     pub pool_idle_timeout: Duration,
     pub max_idle_per_host: usize,
+    pub max_retries: u32,
+    pub initial_retry_delay: Duration,
+    pub max_retry_delay: Duration,
+    pub bulk_operation_timeout: Duration,
 }
 
 impl Default for CacheClientConfig {
@@ -25,6 +29,10 @@ impl Default for CacheClientConfig {
             keep_alive_timeout: Duration::from_secs(60),
             pool_idle_timeout: Duration::from_secs(30),
             max_idle_per_host: 10,
+            max_retries: 3,
+            initial_retry_delay: Duration::from_millis(100),
+            max_retry_delay: Duration::from_secs(10),
+            bulk_operation_timeout: Duration::from_secs(120), // 2 minutes
         }
     }
 }
@@ -128,6 +136,52 @@ impl CacheClient {
         }
     }
 
+    /// Execute an operation with retry logic for connection errors
+    async fn with_retry<T, F, Fut>(&self, operation: F) -> Result<T, CacheError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T, CacheError>>,
+    {
+        let mut last_error = None;
+        let mut delay = self.config.initial_retry_delay;
+
+        for attempt in 0..self.config.max_retries {
+            match tokio::time::timeout(self.config.operation_timeout, operation()).await {
+                Ok(Ok(result)) => return Ok(result),
+                Ok(Err(e)) => {
+                    if !self.is_connection_error(&e) || attempt == self.config.max_retries - 1 {
+                        if self.is_connection_error(&e) {
+                            log::error!("Connection error after {} retries: {}", attempt + 1, self.format_error(&e));
+                        }
+                        return Err(e);
+                    }
+                    
+                    log::warn!("Retry attempt {} of {} due to: {}", attempt + 1, self.config.max_retries, self.format_error(&e));
+                    last_error = Some(e);
+                }
+                Err(_) => {
+                    let timeout_error = CacheError::Connection("Operation timed out".to_string());
+                    if attempt == self.config.max_retries - 1 {
+                        log::error!("Operation timed out after {} retries", attempt + 1);
+                        return Err(timeout_error);
+                    }
+                    
+                    log::warn!("Retry attempt {} of {} due to timeout", attempt + 1, self.config.max_retries);
+                    last_error = Some(timeout_error);
+                }
+            }
+            
+            // Sleep and calculate next delay with exponential backoff
+            tokio::time::sleep(delay).await;
+            delay = std::cmp::min(
+                delay * 2 + Duration::from_millis(rand::random::<u64>() % 100),
+                self.config.max_retry_delay,
+            );
+        }
+
+        Err(last_error.unwrap_or_else(|| CacheError::Connection("Retry failed".to_string())))
+    }
+
     /// Check if a key exists in the cache using a HEAD request
     async fn check_key_exists(&self, key: &str) -> Result<bool, CacheError> {
         let response = self
@@ -181,49 +235,63 @@ impl CacheClient {
 
     /// Download multiple files from the cache, saving them to the current directory
     pub async fn batch_download(&self, filenames: &[String]) -> Vec<BatchResultDownload> {
+
+        let bulk_timeout = tokio::time::timeout(
+            self.config.bulk_operation_timeout,
+            self.batch_download_inner(filenames),
+        );
+
+        match bulk_timeout.await {
+            Ok(inner_results) => inner_results,
+            Err(_) => {
+                // If the entire bulk operation times out, return error status for all files
+                filenames
+                    .iter()
+                    .map(|filename| BatchResultDownload {
+                        filename: filename.clone(),
+                        status: DownloadStatus::Error(CacheError::Connection(
+                            "Bulk operation timeout (2 minutes)".to_string(),
+                        )),
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    async fn batch_download_inner(&self, filenames: &[String]) -> Vec<BatchResultDownload> {
         let mut results = Vec::with_capacity(filenames.len());
 
         let mut downloads = futures::stream::iter(filenames.iter().map(|filename| async move {
             let filename = filename;
-            let key = Path::new(&filename)
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string();                let result = match tokio::time::timeout(
-                    self.config.operation_timeout,
-                    self.get_file(&key, Path::new(&filename)),
-                )
-                .await
-                {
-                    Ok(Ok(status)) => {
-                        if let DownloadStatus::Error(ref err) = status {
-                            if self.is_connection_error(err) {
-                                panic!("Fatal connection error: {}", self.format_error(err));
-                            }
-                        }
-                        BatchResultDownload {
-                            filename: filename.clone(),
-                            status,
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        if self.is_connection_error(&e) {
-                            panic!("Fatal connection error: {}", self.format_error(&e));
-                        }
-                        BatchResultDownload {
-                            filename: filename.clone(),
-                            status: DownloadStatus::Error(e),
-                        }
-                    }
-                Err(_) => {
-                    let timeout_error = CacheError::Connection("Operation timed out".to_string());
-                    panic!(
-                        "Fatal connection error: {}",
-                        self.format_error(&timeout_error)
-                    );
+            
+            // Extract key from filename, handling potential errors
+            let key = match Path::new(&filename).file_name() {
+                Some(name) => name.to_string_lossy().to_string(),
+                None => {
+                    return BatchResultDownload {
+                        filename: filename.clone(),
+                        status: DownloadStatus::Error(CacheError::Io {
+                            path: Path::new(&filename).to_path_buf(),
+                            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid filename"),
+                        }),
+                    };
                 }
             };
-            result
+
+            // Use retry logic for each individual download
+            let result = self
+                .with_retry(|| async {
+                    self.get_file(&key, Path::new(&filename)).await
+                })
+                .await;
+
+            BatchResultDownload {
+                filename: filename.clone(),
+                status: match result {
+                    Ok(status) => status,
+                    Err(e) => DownloadStatus::Error(e),
+                },
+            }
         }))
         .buffer_unordered(self.config.max_concurrent_operations);
 
@@ -236,44 +304,53 @@ impl CacheClient {
 
     /// Upload multiple files to the cache from the current directory
     pub async fn batch_upload(&self, filenames: &[String]) -> Vec<BatchResultUpload> {
+        let bulk_timeout = tokio::time::timeout(
+            self.config.bulk_operation_timeout,
+            self.batch_upload_inner(filenames),
+        );
+
+        match bulk_timeout.await {
+            Ok(inner_results) => inner_results,
+            Err(_) => {
+                // If the entire bulk operation times out, return error status for all files
+                filenames
+                    .iter()
+                    .map(|filename| BatchResultUpload {
+                        filename: filename.clone(),
+                        status: UploadStatus::Error(CacheError::Connection(
+                            "Bulk operation timeout (2 minutes)".to_string(),
+                        )),
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    async fn batch_upload_inner(&self, filenames: &[String]) -> Vec<BatchResultUpload> {
         let mut results = Vec::with_capacity(filenames.len());
 
         let mut uploads = futures_util::stream::iter(filenames.iter().map(|filename| {
             let filename = filename.clone();
             async move {
-                let result = match tokio::time::timeout(
-                    self.config.operation_timeout,
-                    self.put_file(Path::new(&filename)),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => BatchResultUpload {
+                // Use retry logic for each individual upload
+                let result = self
+                    .with_retry(|| async { self.put_file(Path::new(&filename)).await })
+                    .await;
+
+                match result {
+                    Ok(_) => BatchResultUpload {
                         filename: filename.clone(),
                         status: UploadStatus::Success,
                     },
-                    Ok(Err(CacheError::KeyExists(_))) => BatchResultUpload {
+                    Err(CacheError::KeyExists(_)) => BatchResultUpload {
                         filename: filename.clone(),
                         status: UploadStatus::Skip,
                     },
-                    Ok(Err(e)) => {
-                        if self.is_connection_error(&e) {
-                            panic!("Fatal connection error: {}", self.format_error(&e));
-                        }
-                        BatchResultUpload {
-                            filename: filename.clone(),
-                            status: UploadStatus::Error(e),
-                        }
-                    }
-                    Err(_) => {
-                        let timeout_error =
-                            CacheError::Connection("Operation timed out".to_string());
-                        panic!(
-                            "Fatal connection error: {}",
-                            self.format_error(&timeout_error)
-                        );
-                    }
-                };
-                result
+                    Err(e) => BatchResultUpload {
+                        filename: filename.clone(),
+                        status: UploadStatus::Error(e),
+                    },
+                }
             }
         }))
         .buffer_unordered(self.config.max_concurrent_operations);
@@ -286,7 +363,18 @@ impl CacheClient {
     }
 
     async fn put_file(&self, file_path: &Path) -> Result<(), CacheError> {
-        let key = file_path.file_name().unwrap().to_str().unwrap().to_string();
+        let key = file_path
+            .file_name()
+            .ok_or_else(|| CacheError::Io {
+                path: file_path.to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid file path"),
+            })?
+            .to_str()
+            .ok_or_else(|| CacheError::Io {
+                path: file_path.to_path_buf(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in filename"),
+            })?
+            .to_string();
 
         // First check if the key exists using HEAD request
         if self.check_key_exists(&key).await? {
@@ -376,6 +464,74 @@ impl CacheClient {
             StatusCode::NOT_FOUND => Err(CacheError::KeyNotFound(key.to_string())),
             status => Err(CacheError::Server(format!("Unexpected status: {}", status))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_retry_logic() {
+        let config = CacheClientConfig {
+            max_retries: 3,
+            initial_retry_delay: Duration::from_millis(10),
+            max_retry_delay: Duration::from_millis(100),
+            ..Default::default()
+        };
+
+        let client = CacheClient::with_config("http://localhost:8080".to_string(), config);
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+
+        // Test that retry logic retries on connection errors
+        let result = client
+            .with_retry(|| {
+                let count = call_count_clone.clone();
+                async move {
+                    let current = count.fetch_add(1, Ordering::SeqCst);
+                    if current < 2 {
+                        // Fail first 2 attempts with connection error
+                        Err(CacheError::Connection("Simulated connection error".to_string()))
+                    } else {
+                        // Succeed on 3rd attempt
+                        Ok("Success")
+                    }
+                }
+            })
+            .await;
+
+        assert!(result.is_ok());
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_non_connection_error() {
+        let config = CacheClientConfig {
+            max_retries: 3,
+            ..Default::default()
+        };
+
+        let client = CacheClient::with_config("http://localhost:8080".to_string(), config);
+        let call_count = Arc::new(AtomicU32::new(0));
+        let call_count_clone = call_count.clone();
+
+        // Test that retry logic does not retry on non-connection errors
+        let result: Result<(), CacheError> = client
+            .with_retry(|| {
+                let count = call_count_clone.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Err(CacheError::KeyNotFound("test.txt".to_string()))
+                }
+            })
+            .await;
+
+        assert!(result.is_err());
+        // Should only be called once since it's not a connection error
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 }
 

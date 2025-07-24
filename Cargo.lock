@@ -422,6 +422,7 @@ dependencies = [
  "futures-util",
  "log",
  "num_cpus",
+ "rand",
  "reqwest",
  "tempfile",
  "thiserror",
