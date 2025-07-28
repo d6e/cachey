@@ -171,13 +171,17 @@ impl CacheClient {
                 }
             }
             
-            // Sleep and calculate next delay with exponential backoff
-            tokio::time::sleep(delay).await;
-            let jitter_ms = (attempt * 17) % 100; // Simple deterministic spread
-            delay = std::cmp::min(
-                delay * 2 + Duration::from_millis(jitter_ms as u64),
-                self.config.max_retry_delay,
-            );
+            // Sleep before retry (skip on last attempt to avoid unnecessary delay)
+            if attempt < self.config.max_retries - 1 {
+                tokio::time::sleep(delay).await;
+                
+                // Calculate next delay with exponential backoff and jitter
+                let jitter_ms = (attempt * 17 + 13) % 100; // Deterministic spread, always non-zero
+                delay = std::cmp::min(
+                    delay * 2 + Duration::from_millis(jitter_ms as u64),
+                    self.config.max_retry_delay,
+                );
+            }
         }
 
         Err(last_error.unwrap_or_else(|| CacheError::Connection("Retry failed".to_string())))
