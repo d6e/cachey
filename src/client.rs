@@ -173,8 +173,9 @@ impl CacheClient {
             
             // Sleep and calculate next delay with exponential backoff
             tokio::time::sleep(delay).await;
+            let jitter_ms = (attempt * 17) % 100; // Simple deterministic spread
             delay = std::cmp::min(
-                delay * 2 + Duration::from_millis(rand::random::<u64>() % 100),
+                delay * 2 + Duration::from_millis(jitter_ms as u64),
                 self.config.max_retry_delay,
             );
         }
