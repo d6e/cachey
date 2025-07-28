@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures_util::stream::StreamExt;
 use reqwest::{Client, StatusCode};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
@@ -146,10 +146,12 @@ impl CacheClient {
         let mut delay = self.config.initial_retry_delay;
 
         for attempt in 0..self.config.max_retries {
+            let is_last_attempt = attempt == self.config.max_retries - 1;
+            
             match tokio::time::timeout(self.config.operation_timeout, operation()).await {
                 Ok(Ok(result)) => return Ok(result),
                 Ok(Err(e)) => {
-                    if !self.is_connection_error(&e) || attempt == self.config.max_retries - 1 {
+                    if !self.is_connection_error(&e) || is_last_attempt {
                         if self.is_connection_error(&e) {
                             log::error!("Connection error after {} retries: {}", attempt + 1, self.format_error(&e));
                         }
@@ -161,7 +163,7 @@ impl CacheClient {
                 }
                 Err(_) => {
                     let timeout_error = CacheError::Connection("Operation timed out".to_string());
-                    if attempt == self.config.max_retries - 1 {
+                    if is_last_attempt {
                         log::error!("Operation timed out after {} retries", attempt + 1);
                         return Err(timeout_error);
                     }
@@ -172,11 +174,14 @@ impl CacheClient {
             }
             
             // Sleep before retry (skip on last attempt to avoid unnecessary delay)
-            if attempt < self.config.max_retries - 1 {
+            if !is_last_attempt {
                 tokio::time::sleep(delay).await;
                 
                 // Calculate next delay with exponential backoff and jitter
-                let jitter_ms = (attempt * 17 + 13) % 100; // Deterministic spread, always non-zero
+                let jitter_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() % 100;
                 delay = std::cmp::min(
                     delay * 2 + Duration::from_millis(jitter_ms as u64),
                     self.config.max_retry_delay,
@@ -537,6 +542,37 @@ mod tests {
         assert!(result.is_err());
         // Should only be called once since it's not a connection error
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+    
+    #[tokio::test]
+    async fn test_jitter_distribution() {
+        // Collect jitter values to verify they're not deterministic
+        let mut jitter_values = Vec::new();
+        
+        for _ in 0..100 {
+            let jitter_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() % 100;
+            jitter_values.push(jitter_ms as u64);
+            
+            // Small delay to ensure time progresses
+            tokio::time::sleep(Duration::from_micros(10)).await;
+        }
+        
+        // Verify we have a reasonable distribution of values
+        let unique_values = jitter_values.iter().collect::<std::collections::HashSet<_>>().len();
+        
+        // We should have at least 30 unique values out of 100 samples
+        // This would be extremely unlikely with a deterministic formula
+        assert!(unique_values >= 30, "Jitter distribution has only {} unique values out of 100", unique_values);
+        
+        // Verify jitter is bounded between 0-99
+        assert!(jitter_values.iter().all(|&v| v < 100));
+        
+        // Calculate mean to verify reasonable distribution
+        let mean = jitter_values.iter().sum::<u64>() as f64 / jitter_values.len() as f64;
+        assert!(mean > 30.0 && mean < 70.0, "Jitter mean {} is outside expected range", mean);
     }
 }
 
